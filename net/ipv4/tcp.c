@@ -701,10 +701,11 @@ void tcp_push(struct sock *sk, int flags, int mss_now,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
-
+	//取出队尾的数据包
 	skb = tcp_write_queue_tail(sk);
-	if (!skb)
+	if (!skb) //如果没有可以发送的包了，直接返回
 		return;
+	//取出队尾的数据包，如果没有更多的数据片段满足forced_push条件，那么就将该包标记上push
 	if (!(flags & MSG_MORE) || forced_push(tp))
 		tcp_mark_push(tp, skb);
 
@@ -726,7 +727,7 @@ void tcp_push(struct sock *sk, int flags, int mss_now,
 
 	if (flags & MSG_MORE)
 		nonagle = TCP_NAGLE_CORK;
-
+	//将数据包发送出去
 	__tcp_push_pending_frames(sk, mss_now, nonagle);
 }
 
@@ -1257,9 +1258,7 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
 
 	tcp_rate_check_app_limited(sk);  /* is sending application-limited? */
 
-	/* Wait for a connection to finish. One exception is TCP Fast Open
-	 * (passive side) where data is allowed to be sent before a connection
-	 * is fully established.
+	/* 等待连接完成，如果未建立连接则无法发送数据
 	 */
 	if (((1 << sk->sk_state) & ~(TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)) &&
 	    !tcp_passive_fastopen(sk)) {
@@ -1268,6 +1267,10 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
 			goto do_error;
 	}
 
+	/*
+		TCP repair 是Linux3.5引入的新机制，它能实现容器在不同的物理主机之间的迁移，
+		它能够在迁移之后，将TCP连接重新设置到之前的状态
+	*/
 	if (unlikely(tp->repair)) {
 		if (tp->repair_queue == TCP_RECV_QUEUE) {
 			copied = tcp_send_rcvq(sk, msg, size);
@@ -1281,7 +1284,9 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
 		/* 'common' sending to sendq */
 	}
 
+
 	sockcm_init(&sockc, sk);
+
 	if (msg->msg_controllen) {
 		err = sock_cmsg_send(sk, msg, &sockc);
 		if (unlikely(err)) {
@@ -1294,26 +1299,33 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
 	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
 	/* Ok commence sending. */
+	//已经从用户数据块复制出来的字节数
 	copied = 0;
 
 restart:
+	/*获取mss的大小。 size goal 是数据报到达网络设备时所允许的最大长度。
+	  对于不支持分片的网卡，size goal 是MSS的大小，否则是MSS的整数倍 */
 	mss_now = tcp_send_mss(sk, &size_goal, flags);
 
 	err = -EPIPE;
 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
 		goto do_error;
 
+	//for循环，将用户数据发送出去
 	while (msg_data_left(msg)) {
+		//copy代表本次需要发送的数据量
 		int copy = 0;
-
+		//获得队尾的SKB，并判断SKB剩余的能携带的数据量
 		skb = tcp_write_queue_tail(sk);
 		if (skb)
 			copy = size_goal - skb->len;
 
+		//如果没办法携带足够的数据了，则新分配一个SKB
 		if (copy <= 0 || !tcp_skb_can_collapse_to(skb)) {
 			bool first_skb;
 
 new_segment:
+			//allocate new segment
 			if (!sk_stream_memory_free(sk))
 				goto wait_for_space;
 
@@ -1330,6 +1342,7 @@ new_segment:
 
 			process_backlog++;
 
+			//将新的SKB放到队尾，并设定copy和max的值
 			tcp_skb_entail(sk, skb);
 			copy = size_goal;
 
@@ -1416,6 +1429,7 @@ new_segment:
 		if (!copied)
 			TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_PSH;
 
+		//更新TCP的序号
 		WRITE_ONCE(tp->write_seq, tp->write_seq + copy);
 		TCP_SKB_CB(skb)->end_seq += copy;
 		tcp_skb_pcount_set(skb, 0);
@@ -1430,7 +1444,9 @@ new_segment:
 		if (skb->len < size_goal || (flags & MSG_OOB) || unlikely(tp->repair))
 			continue;
 
+		//检查该数据是否必须立即发送
 		if (forced_push(tp)) {
+			//如果需要立即发送，则调用相关函数将队列里的数据都发出去
 			tcp_mark_push(tp, skb);
 			__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
 		} else if (skb == tcp_send_head(sk))
@@ -2419,6 +2435,12 @@ static int tcp_inq_hint(struct sock *sk)
  *	Technical note: in 2.3 we work on _locked_ socket, so that
  *	tricks with *seq access order and skb->users are not required.
  *	Probably, code can be easily improved even more.
+ * sk: 传输控制块
+ * msg:
+ * len:
+ * nonblock: 是否阻塞
+ * flags: 读取数据的标志
+ * addrlen
  */
 
 static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
@@ -2437,6 +2459,8 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 	u32 urg_hole = 0;
 
 	err = -ENOTCONN;
+	//如果此时只是处于LISTEN状态，表明尚未建立连接
+	//此时不允许用户读数据，只能返回
 	if (sk->sk_state == TCP_LISTEN)
 		goto out;
 
@@ -2444,14 +2468,17 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 		*cmsg_flags = TCP_CMSG_INQ;
 		msg->msg_get_inq = 1;
 	}
+	//获取阻塞读取的超时时间，如果进行非阻塞读取，则超时时间为0
 	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 
+	//如果读取的数据带有urgent标记，则需要单独处理
 	/* Urgent data needs to be handled specially. */
 	if (flags & MSG_OOB)
 		goto recv_urg;
-
+	//被修复了
 	if (unlikely(tp->repair)) {
 		err = -EPERM;
+		//如果只是查看数据的话，直接跳转到out处理
 		if (!(flags & MSG_PEEK))
 			goto out;
 
@@ -2465,13 +2492,25 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 		/* 'common' recv queue MSG_PEEK-ing */
 	}
 
+//***************************接下来进行数据复制**************
+
+/*
+	把数据从接收缓存复制到用户空间的过程中，会更新当前已经复制的位置，以及段序号。
+	如果接收数据，则会更新copied_seq, 否则如果只是查看数据而不移走数据，那么不能更新copied_seq
+	因此数据复制到用户空间的过程中，区别接收数据还是查看数据是根据是否更新 copied_seq，所以这里时根
+	据接收数据还是查看来获取要更新标记的地址，而后面的复制操作就完全不关心时接收还是查看。
+*/
 	seq = &tp->copied_seq;
 	if (flags & MSG_PEEK) {
 		peek_seq = tp->copied_seq;
 		seq = &peek_seq;
 	}
-
+	//这个target就是用户输入的读取数据的长度len
 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+
+
+	//接下来检测是否有带外数据，如果在读带外数据，则终止本次正常的数据读取
+	//否则如果用户进程有信号待处理，也终止本次的读取
 
 	do {
 		u32 offset;
@@ -2486,13 +2525,15 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			}
 		}
 
-		/* Next get a buffer. */
-
+		//接下来获取一个缓存区
 		last = skb_peek_tail(&sk->sk_receive_queue);
 		skb_queue_walk(&sk->sk_receive_queue, skb) {
 			last = skb;
 			/* Now that we have two receive queues this
 			 * shouldn't happen.
+			 如果接收队列中的段序号比较大，则说明也获取不到下一个待获取的段，
+			 这样也只能接着处理 prequeue 或后备队列，实际上这种情况不应该发生。
+			 ???
 			 */
 			if (WARN(before(*seq, TCP_SKB_CB(skb)->seq),
 				 "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
@@ -2500,13 +2541,24 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 				 flags))
 				break;
 
+			//到此，我们已经获取了下一个要读取的数据段，计算该段开始读取数据的偏移位置，
+			//当然，该偏移值必须在该段的数据长度范围内才有效。
 			offset = *seq - TCP_SKB_CB(skb)->seq;
+
+			//由于 SYN 标志占用了一个序号，因此如果存在 SYN 标志，则需要调整偏移。
+			//由于偏移 offset 为无符号整型，因此，不会出现负数的情况。
 			if (unlikely(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)) {
 				pr_err_once("%s: found a SYN, please report !\n", __func__);
 				offset--;
 			}
+
+
+			//只有当偏移在该段的数据长度范围内，才说明待读的段才是有效的，
+			//因此，接下来跳转到 found_ok_skb 标签处读取数据。
 			if (offset < skb->len)
 				goto found_ok_skb;
+
+			//如果接收到的段中有 FIN 标识，则跳转到 found_fin_ok 处处理。
 			if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 				goto found_fin_ok;
 			WARN(!(flags & MSG_PEEK),
@@ -2515,11 +2567,28 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 		}
 
 		/* Well, if we have backlog, try to process it now yet. */
-
+		/*
+		只有在读取完数据后，才能在后备队列不为空的情况下区处理接收到后备队列中的TCP 段。
+		否则终止本次读取。由于是因为用户进程对传输控制块进行的锁定，
+		将 TCP 段缓存到后备队列，故而，一旦用户进程释放传输控制块就应该立即处理后备队列。
+		处理后备队列直接在 release_sock 中实现，以确保在任何时候解锁传输控制块时能立即处理后备队列。
+		*/
 		if (copied >= target && !READ_ONCE(sk->sk_backlog.tail))
 			break;
 
+		/*
+		当接收队列中可以读取的段已经读完，在处理 prequeue 或后备队列之前，我们需要先检查是否会存在一些异常的情况。
+		如果存在这类情况，就需要结束这次读取，返回前当然还顺便检测后备队列是否存在数据，如果有则还需要处理。
+		*/
 		if (copied) {
+			/*
+			  检测条件：
+			  1. 有错误发生
+			  2. TCP处于CLOSE状态
+			  3. shutdown状态
+			  4. 收到信号
+			  5. 只是查看数据
+			*/
 			if (!timeo ||
 			    sk->sk_err ||
 			    sk->sk_state == TCP_CLOSE ||
@@ -2527,17 +2596,21 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			    signal_pending(current))
 				break;
 		} else {
+			//检测TCP会话是否即将终结
 			if (sock_flag(sk, SOCK_DONE))
 				break;
-
+			//如果有错误，则返回错误码
 			if (sk->sk_err) {
 				copied = sock_error(sk);
 				break;
 			}
-
+			//如果是shutdown，返回
 			if (sk->sk_shutdown & RCV_SHUTDOWN)
 				break;
-
+			/*
+				如果 TCP 状态为 CLOSE，而套接口不再终结状态，
+				则进程可能在读取一个从未建立连接的套接口，因此，返回相应的错误码。
+			*/
 			if (sk->sk_state == TCP_CLOSE) {
 				/* This occurs when user tries to read
 				 * from never connected socket.
@@ -2545,13 +2618,13 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 				copied = -ENOTCONN;
 				break;
 			}
-
+			//未读到数据，且是非阻塞读取，则返回错误码 Try again。
 			if (!timeo) {
 				copied = -EAGAIN;
 				break;
 			}
-
-			if (signal_pending(current)) {
+			// 检测是否收到数据，并返回相应的错误码
+			if (signal_pending(current)) {	
 				copied = sock_intr_errno(timeo);
 				break;
 			}
@@ -2561,10 +2634,13 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			/* Do not sleep, just process backlog. */
 			__sk_flush_backlog(sk);
 		} else {
+			//检测是否有确认需要立即发送
 			tcp_cleanup_rbuf(sk, copied);
 			sk_wait_data(sk, &timeo, last);
 		}
-
+		
+		//如果有更新 copied_seq，且只是查看数据，则需要更新 peek_seq。
+		//然后继续获取下一个段进行处
 		if ((flags & MSG_PEEK) &&
 		    (peek_seq - copied - urg_hole != tp->copied_seq)) {
 			net_dbg_ratelimited("TCP(%s:%d): Application bug, race in MSG_PEEK\n",
@@ -2576,10 +2652,22 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 
 found_ok_skb:
 		/* Ok so how much can we use? */
+		/*
+		获取该可读取段的数据长度，在前面的处理中已由 TCP 序号得到本次读取数据在该段中的偏移
+		*/
 		used = skb->len - offset;
 		if (len < used)
 			used = len;
 
+		/*
+		如果该段中包含带外数据，则获取带外数据在该段中的偏移。
+		如果偏移在该段可读的范围内，则表示带外数据有效。进而
+		如果带外数据偏移为 0, 则说明目前需要的数据正是带外数据，
+		且带外数据不允许放入到正常的数据流中，即在普通的数据数据
+		流中接受带外数据，则需要调整读取正常数据流的一些参数，如已读取数据的序号、正常数据的偏移等。最后，如果可读数据经过调
+		整之后为 0，则说明没有数据可读，跳过本次读数据过程到 skip_copy 处处理。
+		如果带外数据偏移不为 0, 则需要调整本次读取的正常长度直到读到带外数据为止。
+		*/
 		/* Do we have urgent data here? */
 		if (unlikely(tp->urg_data)) {
 			u32 urg_offset = tp->urg_seq - *seq;
@@ -2597,8 +2685,10 @@ found_ok_skb:
 					used = urg_offset;
 			}
 		}
-
+//**********************接下来处理读数据的情况**********
 		if (!(flags & MSG_TRUNC)) {
+			//调用skb_copy_datagram_msg来将数据复制到用户空间
+			//并根据返回的值来判断是否出现了错误
 			err = skb_copy_datagram_msg(skb, offset, msg, used);
 			if (err) {
 				/* Exception. Bailout! */
@@ -2609,12 +2699,20 @@ found_ok_skb:
 		}
 
 		WRITE_ONCE(*seq, *seq + used);
+		/*
+		调整读正常数据流的一些参数，如已读取数据的序号、已读取数据的长度，
+		剩余的可以使用的用户空间缓存大小。如果是截短，则通过调整这些参数，多余的数据就默默被丢弃了。
+		*/
 		copied += used;
 		len -= used;
 
 		tcp_rcv_space_adjust(sk);
 
 skip_copy:
+		/*
+		如果已经完成了对带外数据的处理，则将带外数据标志清零，设置首部预测标志，
+		下一个接收到的段，就又可以通过首部预测执行快速路径还是慢速路径了。
+		*/
 		if (unlikely(tp->urg_data) && after(tp->copied_seq, tp->urg_seq)) {
 			WRITE_ONCE(tp->urg_data, 0);
 			tcp_fast_path_check(sk);
@@ -2624,12 +2722,13 @@ skip_copy:
 			tcp_update_recv_tstamps(skb, tss);
 			*cmsg_flags |= TCP_CMSG_TS;
 		}
-
+		//如果该段还有数据没有读取 (如带外数据)，则只能继续处理该段，而不能将该段从接收队列中删除
 		if (used + offset < skb->len)
 			continue;
-
+		// 如果发现段中存在 FIN 标志，则跳转到 found\_fin\_ok 标签处处理
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 			goto found_fin_ok;
+		//如果已经读完该段的全部数据，且不是查看数据，则可以将该段从接收队列中删除，然后继续处理后续的段
 		if (!(flags & MSG_PEEK))
 			tcp_eat_recv_skb(sk, skb);
 		continue;
@@ -2662,6 +2761,7 @@ recv_sndq:
 	goto out;
 }
 
+//在此函数中调用tcp_recvmsg_locked进行主要的处理
 int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		int *addr_len)
 {

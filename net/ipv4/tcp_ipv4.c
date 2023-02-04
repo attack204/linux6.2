@@ -1969,7 +1969,8 @@ static void tcp_v4_fill_cb(struct sk_buff *skb, const struct iphdr *iph,
 }
 
 /*
- *	From tcp_input.c
+ *	从IP层接收数据
+ *  skb: 接收到的数据
  */
 
 int tcp_v4_rcv(struct sk_buff *skb)
@@ -1985,21 +1986,26 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	int ret;
 
 	drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
+	//如果不是发往本机的就直接丢弃
 	if (skb->pkt_type != PACKET_HOST)
 		goto discard_it;
 
 	/* Count it even if it's bad */
 	__TCP_INC_STATS(net, TCP_MIB_INSEGS);
 
+	//如果TCP段在传输过程中被分片了，则到达本机后会在IP层重新组装
+	//组装完成后，报文分片都存储在链表中。在此，需把存储在分片中的报文复制到SKB的线性存储区域中
+	//如果发生异常，则丢弃报文
 	if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
 		goto discard_it;
-
+	//得到相关报文头部
 	th = (const struct tcphdr *)skb->data;
-
+	//如果TCP的首部长度小于不带数据的TCP的首部长度，说明TCP数据异常，丢弃
 	if (unlikely(th->doff < sizeof(struct tcphdr) / 4)) {
 		drop_reason = SKB_DROP_REASON_PKT_TOO_SMALL;
 		goto bad_packet;
 	}
+	//检查整个TCP首部长度是否正常，如有异常，则丢弃
 	if (!pskb_may_pull(skb, th->doff * 4))
 		goto discard_it;
 
@@ -2007,12 +2013,16 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	 * Packet length and doff are validated by header prediction,
 	 * provided case of th->doff==0 is eliminated.
 	 * So, we defer the checks. */
-
+	//验证TCP首部中的校验和，如校验和有误，说明报文已经损坏，统计相关信息后丢弃
 	if (skb_checksum_init(skb, IPPROTO_TCP, inet_compute_pseudo))
 		goto csum_error;
 
 	th = (const struct tcphdr *)skb->data;
 	iph = ip_hdr(skb);
+	//在ehash或bash中根据地址和端口查找是否已经建立连接
+	//如果在ehash中找到，则表示已经经过了三次握手并建立了连接
+	//如果在bhash中找到，则表示已经绑定了端口，处于监听状态？？
+	//如果都没有找到，说明此时的传输控制块还没有创建跳转到no_tcp_socket进行处理
 lookup:
 	sk = __inet_lookup_skb(net->ipv4.tcp_death_row.hashinfo,
 			       skb, __tcp_hdrlen(th), th->source,
@@ -2021,9 +2031,10 @@ lookup:
 		goto no_tcp_socket;
 
 process:
+	//TIME_WAIT状态
 	if (sk->sk_state == TCP_TIME_WAIT)
 		goto do_time_wait;
-
+	//NEW_SYN_RECV状态
 	if (sk->sk_state == TCP_NEW_SYN_RECV) {
 		struct request_sock *req = inet_reqsk(sk);
 		bool req_stolen = false;
@@ -2066,6 +2077,7 @@ process:
 		if (!tcp_filter(sk, skb)) {
 			th = (const struct tcphdr *)skb->data;
 			iph = ip_hdr(skb);
+			//在这里获取真正的TCP头部字段值
 			tcp_v4_fill_cb(skb, iph, th);
 			nsk = tcp_check_req(sk, skb, req, false, &req_stolen);
 		} else {
@@ -2097,7 +2109,7 @@ process:
 			return 0;
 		}
 	}
-
+	//ttl小于给定的最小的ttl
 	if (static_branch_unlikely(&ip4_min_ttl)) {
 		/* min_ttl can be changed concurrently from do_ip_setsockopt() */
 		if (unlikely(iph->ttl < READ_ONCE(inet_sk(sk)->min_ttl))) {
@@ -2105,7 +2117,7 @@ process:
 			goto discard_and_relse;
 		}
 	}
-
+	//查找IPsec数据库，如果查找失败，进行相应的处理
 	if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb)) {
 		drop_reason = SKB_DROP_REASON_XFRM_POLICY;
 		goto discard_and_relse;
@@ -2117,43 +2129,50 @@ process:
 		goto discard_and_relse;
 
 	nf_reset_ct(skb);
-
+	//过滤器
 	if (tcp_filter(sk, skb)) {
 		drop_reason = SKB_DROP_REASON_SOCKET_FILTER;
 		goto discard_and_relse;
 	}
 	th = (const struct tcphdr *)skb->data;
 	iph = ip_hdr(skb);
+	//取出TCP头
 	tcp_v4_fill_cb(skb, iph, th);
-
+	//这是dev为null，在传输层这个字段已经没有意义
 	skb->dev = NULL;
-
+	//LISTEN状态
 	if (sk->sk_state == TCP_LISTEN) {
 		ret = tcp_v4_do_rcv(sk, skb);
 		goto put_and_return;
 	}
 
 	sk_incoming_cpu_update(sk);
-
+	//在接收TCP段之前，需要对传输控制块加锁，以同步对传输控制块接收队列的访问
 	bh_lock_sock_nested(sk);
 	tcp_segs_in(tcp_sk(sk), skb);
 	ret = 0;
+	//进程此时没有访问传输控制块
 	if (!sock_owned_by_user(sk)) {
+
 		ret = tcp_v4_do_rcv(sk, skb);
 	} else {
+		//添加到后备队列成功
 		if (tcp_add_backlog(sk, skb, &drop_reason))
 			goto discard_and_relse;
 	}
+	//解锁
 	bh_unlock_sock(sk);
 
 put_and_return:
+	//递减引用计数，当计数为0的时候，使用sk_free释放传输控制块
 	if (refcounted)
 		sock_put(sk);
 
 	return ret;
-
+	//处理没有创建传输控制块收到报文，校验错误，坏包的情况，给对端发送RST报文
 no_tcp_socket:
 	drop_reason = SKB_DROP_REASON_NO_SOCKET;
+	///* 查找 IPsec 数据库，如果查找失败，进行相应处理.*/
 	if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
 		goto discard_it;
 
@@ -2170,6 +2189,7 @@ bad_packet:
 		tcp_v4_send_reset(NULL, skb);
 	}
 
+//丢弃数据包
 discard_it:
 	SKB_DR_OR(drop_reason, NOT_SPECIFIED);
 	/* Discard frame. */
@@ -2182,6 +2202,7 @@ discard_and_relse:
 		sock_put(sk);
 	goto discard_it;
 
+/* 处理 TIME_WAIT 状态 */
 do_time_wait:
 	if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
 		drop_reason = SKB_DROP_REASON_XFRM_POLICY;
@@ -2195,6 +2216,7 @@ do_time_wait:
 		inet_twsk_put(inet_twsk(sk));
 		goto csum_error;
 	}
+	//根据返回值进行相应处理
 	switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
 	case TCP_TW_SYN: {
 		struct sock *sk2 = inet_lookup_listener(net,

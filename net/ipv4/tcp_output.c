@@ -1220,14 +1220,12 @@ INDIRECT_CALLABLE_DECLARE(int ip_queue_xmit(struct sock *sk, struct sk_buff *skb
 INDIRECT_CALLABLE_DECLARE(int inet6_csk_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl));
 INDIRECT_CALLABLE_DECLARE(void tcp_v4_send_check(struct sock *sk, struct sk_buff *skb));
 
-/* This routine actually transmits TCP packets queued in by
- * tcp_do_sendmsg().  This is used by both the initial
- * transmission and possible later retransmissions.
- * All SKB's seen here are completely headerless.  It is our
- * job to build the TCP header, and pass the packet down to
- * IP so it can do the same plus pass the packet off to the
- * device.
- *
+/* 这个routine真实把TCP队列中的包发送给IP 
+   这被用在intial transmiision以及可能的later retransmission中
+ * 在这里所有的SKB都是no header的，我们需要build TCP header并pass it to IP
+   so it can do the same plus pass the packet off to the
+ * device??.
+ * 我们需要持有一份SKB的拷贝
  * We are working here with either a clone of the original
  * SKB, or a fresh unique copy made by the retransmit engine.
  */
@@ -1255,6 +1253,8 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		oskb = skb;
 
 		tcp_skb_tsorted_save(oskb) {
+			//这里收到的SKB可能是原始SKB的克隆
+			//也可能是来自重传引擎的copy
 			if (unlikely(skb_cloned(oskb)))
 				skb = pskb_copy(oskb, gfp_mask);
 			else
@@ -1268,13 +1268,16 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		 */
 		skb->dev = NULL;
 	}
-
+//******************从这里开始构建TCP头**********************************
 	inet = inet_sk(sk);
 	tcb = TCP_SKB_CB(skb);
 	memset(&opts, 0, sizeof(opts));
 
+	//如果是一个syn包，则调用syn中的option来初始化
 	if (unlikely(tcb->tcp_flags & TCPHDR_SYN)) {
 		tcp_options_size = tcp_syn_options(sk, skb, &opts, &md5);
+	/*否则调用tcp_established_options来构建相应的格式，注意这里仅仅是计算出来的具体的选项及其大小
+	  并没有形成最终TCP包中的格式*/
 	} else {
 		tcp_options_size = tcp_established_options(sk, skb, &opts,
 							   &md5);
@@ -1289,6 +1292,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		if (tcp_skb_pcount(skb) > 1)
 			tcb->tcp_flags |= TCPHDR_PSH;
 	}
+	//根据选项的大小，可以进一步推算出TCP头部的大小，之后调用相关函数在skb头部为TCP头部留出空间
 	tcp_header_size = tcp_options_size + sizeof(struct tcphdr);
 
 	/* if no packet is in qdisc/device queue, then allow XPS to select
@@ -1316,7 +1320,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	refcount_add(skb->truesize, &sk->sk_wmem_alloc);
 
 	skb_set_dst_pending_confirm(skb, sk->sk_dst_pending_confirm);
-
+//******************正式构建TCP头**********************************
 	/* Build TCP header and checksum it. */
 	th = (struct tcphdr *)skb->data;
 	th->source		= inet->inet_sport;
@@ -1350,7 +1354,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		 */
 		th->window	= htons(min(tp->rcv_wnd, 65535U));
 	}
-
+	//在写完首部后，调用函数将TCP选项写入
 	tcp_options_write(th, tp, &opts);
 
 #ifdef CONFIG_TCP_MD5SIG
@@ -1368,7 +1372,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	INDIRECT_CALL_INET(icsk->icsk_af_ops->send_check,
 			   tcp_v6_send_check, tcp_v4_send_check,
 			   sk, skb);
-
+	//触发相关的TCP事件，这些会被用于拥塞控制算法
 	if (likely(tcb->tcp_flags & TCPHDR_ACK))
 		tcp_event_ack_sent(sk, tcp_skb_pcount(skb), rcv_nxt);
 
@@ -1395,12 +1399,13 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			       sizeof(struct inet6_skb_parm)));
 
 	tcp_add_tx_delay(skb, tp);
-
+	//在这里，我们将包加入到IP层的发送队列
 	err = INDIRECT_CALL_INET(icsk->icsk_af_ops->queue_xmit,
 				 inet6_csk_xmit, ip_queue_xmit,
 				 sk, skb, &inet->cork.fl);
 
 	if (unlikely(err > 0)) {
+		//如果发生了丢包(如被主动队列管理丢弃)，那么进入到拥塞控制状态
 		tcp_enter_cwr(sk);
 		err = net_xmit_eval(err);
 	}
@@ -2486,15 +2491,13 @@ static bool tcp_pacing_check(struct sock *sk)
 }
 
 /* TCP Small Queues :
- * Control number of packets in qdisc/devices to two packets / or ~1 ms.
- * (These limits are doubled for retransmits)
- * This allows for :
- *  - better RTT estimation and ACK scheduling
- *  - faster recovery
- *  - high rates
- * Alas, some drivers / subsystems require a fair amount
- * of queued bytes to ensure line rate.
- * One example is wifi aggregation (802.11 AMPDU)
+ * 控制进入 qdisc/devices的包的数量 to 2 packets / or ~1 ms. (这个数量在重传时被double)
+ * 这允许 :
+ *  - 更好的RTT估算和ACK调度
+ *  - 更快的恢复
+ *  - 高数据率
+ * 遗憾的是，一些driver/subsystem需要大量的queued bytes来确保line rate(线路速率)
+ * 其中一个例子是wifi aggragation (802.11 AMPDU)
  */
 static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
 				  unsigned int factor)
@@ -2584,19 +2587,21 @@ void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
 		tcp_chrono_set(tp, TCP_CHRONO_BUSY);
 }
 
-/* This routine writes packets to the network.  It advances the
+/* 这个routine把包发送到newwork.  It advances the
  * send_head.  This happens as incoming acks open up the remote
  * window for us.
  *
  * LARGESEND note: !tcp_urg_mode is overkill, only frames between
  * snd_up-64k-mss .. snd_up cannot be large. However, taking into
  * account rare use of URG, this is not a big flaw.
- *
- * Send at most one packet when push_one > 0. Temporarily ignore
- * cwnd limit to force at most one packet out when push_one == 2.
-
+ 
  * Returns true, if no segments are in flight and we have queued segments,
  * but cannot send anything now because of SWS or another problem.
+ * Parameter:
+ * 	sk: 套接字
+ *  mss_now: 当前有效的MSS大小
+ *  nonagle：是否启用Nagle算法
+ *  push_one: 当push_one大于0时，最多发送一个包。当push_one == 2时会忽略cwn的大小
  */
 static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			   int push_one, gfp_t gfp)
@@ -2609,11 +2614,12 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 	bool is_cwnd_limited = false, is_rwnd_limited = false;
 	u32 max_segs;
 
+	//该变量用于统计发送的包的数量，初始化为0
 	sent_pkts = 0;
 
 	tcp_mstamp_refresh(tp);
 	if (!push_one) {
-		/* Do MTU probing. */
+		/* 进行MTU探测 */
 		result = tcp_mtu_probe(sk);
 		if (!result) {
 			return false;
@@ -2621,8 +2627,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			sent_pkts = 1;
 		}
 	}
-
+	//获取最大的段数
 	max_segs = tcp_tso_segs(sk, mss_now);
+	//不断循环发送段数，进行发送
 	while ((skb = tcp_send_head(sk))) {
 		unsigned int limit;
 
@@ -2637,25 +2644,28 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 
 		if (tcp_pacing_check(sk))
 			break;
-
+		//获取TSO的信息
 		tso_segs = tcp_init_tso_segs(skb, mss_now);
 		BUG_ON(!tso_segs);
-
+		//获取CWND的剩余大小
 		cwnd_quota = tcp_cwnd_test(tp, skb);
 		if (!cwnd_quota) {
 			if (push_one == 2)
-				/* Force out a loss probe pkt. */
+				/* 强制发送一个包进行丢包探测 */
 				cwnd_quota = 1;
 			else
+				/*如果窗口大小为0，则无法发送任何东西*/
 				break;
 		}
 
+		//如果当前段不完全在发送窗口内，则无法发送
 		if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now))) {
 			is_rwnd_limited = true;
 			break;
 		}
 
 		if (tso_segs == 1) {
+			//如果需要TSO分段，则检查是否需要延迟发送
 			if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
 						     (tcp_skb_is_last(sk, skb) ?
 						      nonagle : TCP_NAGLE_PUSH))))
@@ -2667,6 +2677,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 				break;
 		}
 
+		//根据分段对于包进行分段处理。
 		limit = mss_now;
 		if (tso_segs > 1 && !tcp_urg_mode(tp))
 			limit = tcp_mss_split_point(sk, skb, mss_now,
@@ -2675,10 +2686,14 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 							  max_segs),
 						    nonagle);
 
+		//如果长度超过了分段限制，那么调用tso_fragment进行分段
 		if (skb->len > limit &&
 		    unlikely(tso_fragment(sk, skb, limit, mss_now, gfp)))
 			break;
 
+		//TCP小队列机制，这个要看一下
+		//如果cwnd太大，超过了驱动队列中待发送的包的数目进而导致丢包
+		//为了解决此问题，Linux引入了小队列机制
 		if (tcp_small_queue_check(sk, skb, 0))
 			break;
 
@@ -2689,7 +2704,8 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		 */
 		if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq)
 			break;
-
+		
+		//调用tcp_tranmit_skb将数据发送出去
 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
 			break;
 
@@ -2699,6 +2715,7 @@ repair:
 		 */
 		tcp_event_new_data_sent(sk, skb);
 
+		//如果发送的段小于MSS，则更新最后一个小包的序号
 		tcp_minshall_update(tp, mss_now, skb);
 		sent_pkts += tcp_skb_pcount(skb);
 
@@ -2715,6 +2732,7 @@ repair:
 	if (likely(sent_pkts || is_cwnd_limited))
 		tcp_cwnd_validate(sk, is_cwnd_limited);
 
+	//如果发送了数据，那么update profiling
 	if (likely(sent_pkts)) {
 		if (tcp_in_cwnd_reduction(sk))
 			tp->prr_out += sent_pkts;
@@ -2867,13 +2885,11 @@ rearm_timer:
 void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 			       int nonagle)
 {
-	/* If we are closed, the bytes will have to remain here.
-	 * In time closedown will finish, we empty the write queue and
-	 * all will be happy.
+	/* 如果连接已经关闭了，那么直接返回
 	 */
 	if (unlikely(sk->sk_state == TCP_CLOSE))
 		return;
-
+	//将剩余的部分发送出去
 	if (tcp_write_xmit(sk, cur_mss, nonagle, 0,
 			   sk_gfp_mask(sk, GFP_ATOMIC)))
 		tcp_check_probe_timer(sk);
