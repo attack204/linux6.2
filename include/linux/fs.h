@@ -938,45 +938,45 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
 }
 
 struct file {
-	union {
-		struct llist_node	f_llist;
-		struct rcu_head 	f_rcuhead;
-		unsigned int 		f_iocb_flags;
-	};
-	struct path		f_path;
-	struct inode		*f_inode;	/* cached value */
-	const struct file_operations	*f_op;
+    union {
+        struct llist_node   f_llist; //文件对象链表
+        struct rcu_head     f_rcuhead; //释放之后的RCU链表
+        unsigned int        f_iocb_flags;
+    };
+    struct path     f_path; //包含目录项
+    struct inode        *f_inode;   /* cached value */
+    const struct file_operations    *f_op; //文件操作表
 
-	/*
-	 * Protects f_ep, f_flags.
-	 * Must not be taken from IRQ context.
-	 */
-	spinlock_t		f_lock;
-	atomic_long_t		f_count;
-	unsigned int 		f_flags;
-	fmode_t			f_mode;
-	struct mutex		f_pos_lock;
-	loff_t			f_pos;
-	struct fown_struct	f_owner;
-	const struct cred	*f_cred;
-	struct file_ra_state	f_ra;
+    /*
+     * Protects f_ep, f_flags.
+     * Must not be taken from IRQ context.
+     */
+    spinlock_t      f_lock; //单个文件结构锁
+    atomic_long_t       f_count; //文件对象的使用计数
+    unsigned int        f_flags; //当打开文件时所指定的标志
+    fmode_t         f_mode; //文件的访问模式
+    struct mutex        f_pos_lock;
+    loff_t          f_pos; //文件当前的位移量
+    struct fown_struct  f_owner;
+    const struct cred   *f_cred;
+    struct file_ra_state    f_ra;
 
-	u64			f_version;
+    u64         f_version;
 #ifdef CONFIG_SECURITY
-	void			*f_security;
+    void            *f_security;
 #endif
-	/* needed for tty driver, and maybe others */
-	void			*private_data;
+    /* needed for tty driver, and maybe others */
+    void            *private_data;
 
 #ifdef CONFIG_EPOLL
-	/* Used by fs/eventpoll.c to link all the hooks to this file */
-	struct hlist_head	*f_ep;
+    /* Used by fs/eventpoll.c to link all the hooks to this file */
+    struct hlist_head   *f_ep;
 #endif /* #ifdef CONFIG_EPOLL */
-	struct address_space	*f_mapping;
-	errseq_t		f_wb_err;
-	errseq_t		f_sb_err; /* for syncfs */
+    struct address_space    *f_mapping;
+    errseq_t        f_wb_err;
+    errseq_t        f_sb_err; /* for syncfs */
 } __randomize_layout
-  __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+  __attribute__((aligned(4)));  /* lest something weird decides that 2 is OK */
 
 struct file_handle {
 	__u32 handle_bytes;
